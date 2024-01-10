@@ -8,3 +8,4 @@ pub fn test_fcs_reader() -> Result<(), FCSError> {
     read_fcs(FORMAT_3_1_TESTFILE)?;
     Ok(())
 }
+
