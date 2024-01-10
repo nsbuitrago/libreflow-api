@@ -45,12 +45,13 @@ pub enum FCSError {
 ///    Ok(())
 ///    }
 /// ```
-pub fn read_fcs<P: AsRef<Path>>(path: P) -> Result<(), FCSError> {
+pub fn read_fcs<P: AsRef<Path>>(path: P) -> Result<HashMap<String, String>, FCSError> {
     let fcs_file = File::open(path)?;
     let mut reader = BufReader::new(fcs_file);
     let txt_offsets = parse_fcs_header(&mut reader)?;
     let metadata = parse_fcs_metadata(&mut reader, &txt_offsets)?;
-    Ok(())
+    
+    Ok(metadata)
 }
 
 /// Parse FCS header and return offsets to txt, data, and analysis segments
