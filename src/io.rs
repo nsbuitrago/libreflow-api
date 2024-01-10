@@ -7,7 +7,10 @@ use std::collections::HashMap;
 
 const VALID_FCS_VERSIONS: [&[u8; 6]; 2] = [b"FCS3.0", b"FCS3.1"];
 
-const N_FCS_OFFSETS: usize = 2; // we set this to 2 since we only care about the txt header segment
+/// Number of offsets to read from the FCS header. We set this to 2 since we only care about the
+/// txt header segment. The offsets for the data and analysis segments are duplicated in the text
+/// segment and we would have to check the text segment anyway. 
+const N_FCS_OFFSETS: usize = 2;
 
 #[derive(Debug, Error)]
 pub enum FCSError {
@@ -21,17 +24,37 @@ pub enum FCSError {
     InvlidMetadata,
 }
 
-/// Read FCS file data and return as Sample
+/// Read FCS file metadata and event data into Sample
+///
+/// This function provides parsing of FCS files into Sample structs.
+///
+/// # Errors
+///
+/// This function will return an error if `path` does not exist or is not a valid FCS file.
+///
+/// If the file is a valid FCS file, but the metadata or event data cannot be parsed, an error
+/// will be returned.
+///
+/// # Examples
+///
+/// ```no_run
+/// use libreflow_api::io::{read_fcs, FCSError};
+///
+/// fn main() -> Result<(), FCSError> {
+///    let sample = read_fcs("./path/to/fcs_file.fcs")?;
+///    Ok(())
+///    }
+/// ```
 pub fn read_fcs<P: AsRef<Path>>(path: P) -> Result<(), FCSError> {
     let fcs_file = File::open(path)?;
     let mut reader = BufReader::new(fcs_file);
-    let txt_offsets = parse_header(&mut reader)?;
-    let metadata = parse_metadata(&mut reader, &txt_offsets)?;
+    let txt_offsets = parse_fcs_header(&mut reader)?;
+    let metadata = parse_fcs_metadata(&mut reader, &txt_offsets)?;
     Ok(())
 }
 
 /// Parse FCS header and return offsets to txt, data, and analysis segments
-pub fn parse_header(reader: &mut BufReader<File>) -> Result<[u64; N_FCS_OFFSETS], FCSError> {
+fn parse_fcs_header(reader: &mut BufReader<File>) -> Result<[u64; N_FCS_OFFSETS], FCSError> {
 
     let mut fcs_version = [0u8; 6];
     reader.read_exact(&mut fcs_version)?;
@@ -61,7 +84,7 @@ pub fn parse_header(reader: &mut BufReader<File>) -> Result<[u64; N_FCS_OFFSETS]
 }
 
 /// Parse FCS metadata from text segment
-pub fn parse_metadata(reader: &mut BufReader<File>, offsets: &[u64]) -> Result<(), FCSError> {
+fn parse_fcs_metadata(reader: &mut BufReader<File>, offsets: &[u64]) -> Result<HashMap<String, String>, FCSError> {
 
     let mut txt_segment = vec![0u8; (offsets[1] - offsets[0]) as usize];
     reader.seek(SeekFrom::Start(offsets[0]))?;
@@ -93,6 +116,7 @@ pub fn parse_metadata(reader: &mut BufReader<File>, offsets: &[u64]) -> Result<(
             value.push_str(s);
         }
     }
-    Ok(())
+
+    Ok(metadata)
 }
 
