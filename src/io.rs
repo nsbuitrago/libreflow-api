@@ -53,50 +53,112 @@ const REQUIRED_KEYWORDS: [&str; 12] = [
     "$TOT" // total number of events in the data set
 ];
 
+enum FCSEvent {
+    F32(Vec<f32>),
+    F64(Vec<f64>),
+    U16(Vec<u16>),
+    U32(Vec<u32>),
+    U64(Vec<u64>),
+    U128(Vec<u128>),
+}
+
+impl FCSEvent {
+    fn as_f64(&self) -> Vec<f64> {
+        match self {
+            FCSEvent::F32(data) => data.iter().map(|&x| x as f64).collect(),
+            FCSEvent::F64(data) => data.to_owned(),
+            FCSEvent::U16(data) => data.iter().map(|&x| x as f64).collect(),
+            FCSEvent::U32(data) => data.iter().map(|&x| x as f64).collect(),
+            FCSEvent::U64(data) => data.iter().map(|&x| x as f64).collect(),
+            FCSEvent::U128(data) => data.iter().map(|&x| x as f64).collect(),
+        }
+    }
+}
+
+trait EventRead<B: ByteOrder> {
+    fn read_event(bytes: &[u8]) -> Self;
+}
+
+impl<B: ByteOrder> EventRead<B> for f32 {
+    fn read_event(bytes: &[u8]) -> f32 {
+        B::read_f32(bytes)
+    }
+}
+
+impl<B: ByteOrder> EventRead<B> for f64 {
+    fn read_event(bytes: &[u8]) -> Self {
+        B::read_f64(bytes)
+    }
+}
+
+impl<B: ByteOrder> EventRead<B> for u16 {
+    fn read_event(bytes: &[u8]) -> Self {
+        B::read_u16(bytes)
+    }
+}
+
+impl<B: ByteOrder> EventRead<B> for u32 {
+    fn read_event(bytes: &[u8]) -> Self {
+        B::read_u32(bytes)
+    }
+}
+
+impl<B: ByteOrder> EventRead<B> for u64 {
+    fn read_event(bytes: &[u8]) -> Self {
+        B::read_u64(bytes)
+    }
+}
+
+impl<B: ByteOrder> EventRead<B> for u128 {
+    fn read_event(bytes: &[u8]) -> Self {
+        B::read_u128(bytes)
+    }
+}
+
 /// FCS sample holding metadata and event data
 pub struct Sample {
     pub metadata: HashMap<String, String>,
     pub event_data: HashMap<String, Vec<f64>>,
 }
 
-/// Experiment holding 1 or more samples
-pub struct Experiment {
-    pub samples: Vec<Sample>,
-}
-
-impl Experiment {
-
-    /// Load experiment data from directory
-    pub fn load<P: AsRef<Path>>(exp_dir: P) -> Self {
-        // get list of fcs files in directory
-        // for each file, read metadata and event data into sample
-        // add sample to experiment
-        // return experiment
-        //
-        // let samples: Vec<Sample> = Vec::with_capacity(sample_paths.len());
-    
-        Self {
-            samples: Vec::new(),
-        }
-    }
-
-    pub fn save<P: AsRef<Path>>(&self, exp_dir: P) -> Result<(), FCSError> {
-        // create directory if it doesn't exist
-        // for each sample, create a directory
-        // for each sample, write metadata to txt file
-        // for each sample, write event data to csv file
-        //
-        // let sample_paths: Vec<PathBuf> = Vec::with_capacity(self.samples.len());
-        //
-        // for sample in self.samples {
-        //     let sample_dir = exp_dir.join(sample.name);
-        //     sample_paths.push(sample_dir);
-        // }
-        //
-        // Ok(())
-        Ok(())
-    }
-}
+// /// Experiment holding 1 or more samples
+// pub struct Experiment {
+//     pub samples: Vec<Sample>,
+// }
+//
+// impl Experiment {
+//
+//     /// Load experiment data from directory
+//     pub fn load<P: AsRef<Path>>(exp_dir: P) -> Self {
+//         // get list of fcs files in directory
+//         // for each file, read metadata and event data into sample
+//         // add sample to experiment
+//         // return experiment
+//         //
+//         // let samples: Vec<Sample> = Vec::with_capacity(sample_paths.len());
+//     
+//         Self {
+//             samples: Vec::new(),
+//         }
+//     }
+//
+//     pub fn save<P: AsRef<Path>>(&self, exp_dir: P) -> Result<(), FCSError> {
+//         // create directory if it doesn't exist
+//         // for each sample, create a directory
+//         // for each sample, write metadata to txt file
+//         // for each sample, write event data to csv file
+//         //
+//         // let sample_paths: Vec<PathBuf> = Vec::with_capacity(self.samples.len());
+//         //
+//         // for sample in self.samples {
+//         //     let sample_dir = exp_dir.join(sample.name);
+//         //     sample_paths.push(sample_dir);
+//         // }
+//         //
+//         // Ok(())
+//         Ok(())
+//     }
+// }
 
 /// Read FCS file metadata and event data into Sample
 ///
@@ -185,7 +247,6 @@ fn parse_fcs_metadata(reader: &mut BufReader<File>) -> Result<HashMap<String, St
 
             if keyword.len() > 0 && value.len() > 0 {
                 metadata.insert(keyword.to_uppercase(), value.to_owned());
-                // there's probably a better way to do this
                 value.clear();
                 keyword.clear()
             }
@@ -240,8 +301,6 @@ fn parse_fcs_event_data(reader: &mut BufReader<File>, metadata: &HashMap<String,
     let data_segment_size: u64 = data_segment_end - data_segment_start;
     reader.seek(SeekFrom::Start(data_segment_start))?;
 
-    // FIXME: byte order will be the same for all parameters I think, so we should refactor this to check
-    // byte ordre only once per parameter
     for i in 1..=n_params {
         match byte_order {
             "1,2,3,4" => {
@@ -263,72 +322,42 @@ fn parse_fcs_event_data(reader: &mut BufReader<File>, metadata: &HashMap<String,
 }
 
 fn get_events<B: byteorder::ByteOrder>(reader: &mut BufReader<File>, data_type: &str, n_events: usize, metadata: &HashMap<String, String>, param_idx: usize) -> Result<Vec<f64>, FCSError> {
-    // FIXME: this is a mess. We need to refactor this to be more readable and less repetitive.
     let data = match data_type {
-        "F" => {
-            let mut data = Vec::with_capacity(n_events);
-            let mut float_buffer = vec![0; n_events * std::mem::size_of::<f32>()];
-            reader.read_exact(&mut float_buffer)?;
-            for i in 0..n_events {
-                let float_value = B::read_f32(&float_buffer[i * 4..(i + 1) * 4]) as f64;
-                data.push(float_value);
-            }
-            data
-        },
-        "D" => {
-            let mut data = Vec::with_capacity(n_events);
-            for i in 0..n_events {
-                let float_buffer = vec![0; n_events * std::mem::size_of::<f64>()];
-                let double = B::read_f64(&float_buffer[i * 8..(i+1) * 8]);
-                data.push(double);
-            }
-            data
-        },
+        "F" => FCSEvent::F32(read_events::<B, f32>(reader, n_events)?),
+        "D" => FCSEvent::F64(read_events::<B, f64>(reader, n_events)?),
         "I" => {
             // just unwrap the things since we checked they are present already.
             let bits_per_param = metadata.get(&format!("$P{}B", param_idx)).unwrap().parse::<usize>().unwrap();
-            match bits_per_param / 8 {
-                2 => {
-                    let mut data = Vec::with_capacity(n_events);
-                    for i in 0..n_events {
-                        let events_u16 = vec![0; n_events * std::mem::size_of::<u16>()];
-                        let double = B::read_u16(&events_u16[i * 2..(i+1) * 2]) as f64;
-                        data.push(double);
-                    }
-                    data
-                },
-                4 => {
-                    let mut data = Vec::with_capacity(n_events);
-                    for i in 0..n_events {
-                        let events_u32= vec![0; n_events * std::mem::size_of::<u32>()];
-                        let double = B::read_u16(&events_u32[i * 4..(i+1) * 4]) as f64;
-                        data.push(double);
-                    }
-                    data
-                },
-                8 => {
-                    let mut data = Vec::with_capacity(n_events);
-                    for i in 0..n_events {
-                        let events_u64= vec![0; n_events * std::mem::size_of::<u64>()];
-                        let double = B::read_u16(&events_u64[i * 8..(i+1) * 8]) as f64;
-                        data.push(double);
-                    }
-                    data
-                },
-                16 => {
-                    let mut data = Vec::with_capacity(n_events);
-                    for i in 0..n_events {
-                        let events_u128= vec![0; n_events * std::mem::size_of::<u128>()];
-                        let double = B::read_u16(&events_u128[i * 16..(i+1) * 16]) as f64;
-                        data.push(double);
-                    }
-                    data
-                },
+            match bits_per_param {
+                16 => FCSEvent::U16(read_events::<B, u16>(reader, n_events)?),
+                32 => FCSEvent::U32(read_events::<B, u32>(reader, n_events)?),
+                64 => FCSEvent::U64(read_events::<B, u64>(reader, n_events)?),
+                128 => FCSEvent::U128(read_events::<B, u128>(reader, n_events)?),
                 _ => return Err(FCSError::InvalidData(("Bits for param type not supported").to_string())),
             }
         }
         _ => return Err(FCSError::InvalidData("FCS data type not supported. Must be F, D, or I".to_string()))
     };
+
+    Ok(data.as_f64())
+}
+
+fn read_events<B, T>(reader: &mut BufReader<File>, n_events: usize) -> Result<Vec<T>, FCSError>
+where
+    B: ByteOrder,
+    T: EventRead<B>, 
+{
+    let type_mem_size = std::mem::size_of::<T>();
+    let mut data = Vec::with_capacity(n_events);
+    let mut buffer = vec![0; n_events * type_mem_size];
+    reader.read_exact(&mut buffer)?;
+
+    for i in 0..n_events {
+        let start = i * type_mem_size;
+        let float_value = T::read_event(&buffer[start..start + type_mem_size]);
+        data.push(float_value);
+    }
+
 
     Ok(data)
 }
