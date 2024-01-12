@@ -86,41 +86,22 @@ trait EventRead<B: ByteOrder> {
     fn read_event(bytes: &[u8]) -> Self;
 }
 
-impl<B: ByteOrder> EventRead<B> for f32 {
-    fn read_event(bytes: &[u8]) -> f32 {
-        B::read_f32(bytes)
-    }
+macro_rules! impl_event_read {
+    ($type:ty, $read_fn:ident) => {
+        impl<B: ByteOrder> EventRead<B> for $type {
+            fn read_event(bytes: &[u8]) -> Self {
+                B::$read_fn(bytes)
+            }
+        }
+    };
 }
 
-impl<B: ByteOrder> EventRead<B> for f64 {
-    fn read_event(bytes: &[u8]) -> Self {
-        B::read_f64(bytes)
-    }
-}
-
-impl<B: ByteOrder> EventRead<B> for u16 {
-    fn read_event(bytes: &[u8]) -> Self {
-        B::read_u16(bytes)
-    }
-}
-
-impl<B: ByteOrder> EventRead<B> for u32 {
-    fn read_event(bytes: &[u8]) -> Self {
-        B::read_u32(bytes)
-    }
-}
-
-impl<B: ByteOrder> EventRead<B> for u64 {
-    fn read_event(bytes: &[u8]) -> Self {
-        B::read_u64(bytes)
-    }
-}
-
-impl<B: ByteOrder> EventRead<B> for u128 {
-    fn read_event(bytes: &[u8]) -> Self {
-        B::read_u128(bytes)
-    }
-}
+impl_event_read!(f32, read_f32);
+impl_event_read!(f64, read_f64);
+impl_event_read!(u16, read_u16);
+impl_event_read!(u32, read_u32);
+impl_event_read!(u64, read_u64);
+impl_event_read!(u128, read_u128);
 
 /// FCS sample holding metadata and event data
 pub struct Sample {
@@ -201,7 +182,10 @@ pub fn read_fcs<P: AsRef<Path>>(path: P) -> Result<Sample, FCSError> {
 }
 
 /// Parse FCS header and return offsets to txt, data, and analysis segments
-fn parse_fcs_header(reader: &mut BufReader<File>) -> Result<[u64; N_FCS_OFFSETS], FCSError> {
+///
+/// This function parses/validates the FCS version and parses/returns the byte offsets to the
+/// text segment.
+fn parse_fcs_header(reader: &mut BufReader<File>) -> Result<Vec<u64>, FCSError> {
 
     let mut fcs_version = [0u8; 6];
     reader.read_exact(&mut fcs_version)?;
@@ -212,25 +196,25 @@ fn parse_fcs_header(reader: &mut BufReader<File>) -> Result<[u64; N_FCS_OFFSETS]
         ));
     } 
 
-    reader.seek(SeekFrom::Current(4))?;
-    let mut header_offsets = [0u64; N_FCS_OFFSETS];
+    reader.seek(SeekFrom::Current(4))?; // FCS headers contain 4 spaces between version and offsets
 
-    for i in 0..N_FCS_OFFSETS {
-        let mut offset = [0u8; 8];
-        reader.read_exact(&mut offset)?;
+    let header_offsets: Result<Vec<u64>, FCSError> = (0..N_FCS_OFFSETS)
+        .map(|_| {
+            let mut offset = [0u8; 8];
+            reader.read_exact(&mut offset)?;
+            atoi::<u64>(&offset.trim_ascii_start())
+                .ok_or(FCSError::InvalidHeader)
+        })
+        .collect();
 
-        match atoi::<u64>(&offset.trim_ascii_start()) {
-            Some(offset) => header_offsets[i] = offset,
-            None => {
-                return Err(FCSError::InvalidHeader);
-            }
-        };
-    }
-
-    Ok(header_offsets)
+    Ok(header_offsets?)
 }
 
 /// Parse FCS metadata from text segment
+///
+/// This function parses the text segment and retuns a Result of either a HashMap or an error.
+/// The keys are the FCS keywords and the values are the keyword values. Parsed metadata is checked
+/// to make sure all required non parameter-indexed keywords are present.
 fn parse_fcs_metadata(reader: &mut BufReader<File>) -> Result<HashMap<String, String>, FCSError> {
 
     let offsets = parse_fcs_header(reader)?;
@@ -248,30 +232,17 @@ fn parse_fcs_metadata(reader: &mut BufReader<File>) -> Result<HashMap<String, St
     let mut keyword = String::new();
     let mut metadata: HashMap<String, String> = HashMap::new();
 
-    for s in txt_segment.split(delimiter) {
-
+    txt_segment.split(delimiter).fold(&mut metadata, |metadata, s| {
         if s.starts_with("$") {
-
-            if keyword.len() > 0 && value.len() > 0 {
-                metadata.insert(keyword.to_uppercase(), value.to_owned());
-                value.clear();
-                keyword.clear()
+            if !keyword.is_empty() && !value.is_empty() {
+                metadata.insert(std::mem::take(&mut keyword).to_uppercase(), std::mem::take(&mut value));
             }
-
             keyword = s.to_string();
-
         } else {
             value.push_str(s);
         }
-    }
-
-    check_required_fcs_keywords(&metadata)?;
-
-    Ok(metadata)
-}
-
-/// Check that all required keywords are present in FCS metadata
-fn check_required_fcs_keywords(metadata: &HashMap<String, String>) -> Result<(), FCSError> {
+        metadata
+    });
 
     for keyword in REQUIRED_KEYWORDS.iter() {
         if !metadata.contains_key(*keyword) {
@@ -279,7 +250,7 @@ fn check_required_fcs_keywords(metadata: &HashMap<String, String>) -> Result<(),
         }
     }
 
-    Ok(())
+    Ok(metadata)
 }
 
 /// Parse FCS events from data segment
@@ -310,6 +281,7 @@ fn parse_fcs_event_data(reader: &mut BufReader<File>, metadata: &HashMap<String,
         match byte_order {
             "1,2,3,4" => {
                 events = get_events::<LittleEndian>(reader, data_type, n_events, metadata, i)?;
+                // events = FCSEvents::<LittleEndian>::parse(reader, data_type, n_events, metadata, i)?;
             },
             "4,3,2,1" => {
                 events = get_events::<BigEndian>(reader, data_type, n_events, metadata, i)?;
@@ -353,17 +325,10 @@ where
     T: EventRead<B>, 
 {
     let type_mem_size = std::mem::size_of::<T>();
-    let mut data = Vec::with_capacity(n_events);
-    let mut buffer = vec![0; n_events * type_mem_size];
-    reader.read_exact(&mut buffer)?;
-
-    for i in 0..n_events {
-        let start = i * type_mem_size;
-        let float_value = T::read_event(&buffer[start..start + type_mem_size]);
-        data.push(float_value);
-    }
-
-
-    Ok(data)
+    (0..n_events).map(|_| {
+        let mut buffer = vec![0; type_mem_size];
+        reader.read_exact(&mut buffer)?;
+        Ok(T::read_event(&buffer))
+    }).collect()
 }
 
