@@ -62,15 +62,22 @@ enum FCSEvent {
     U128(Vec<u128>),
 }
 
+macro_rules! as_f64 {
+    ($data:expr) => {
+        $data.iter().map(|&x| x as f64).collect()
+    };
+}
+
 impl FCSEvent {
+
     fn as_f64(&self) -> Vec<f64> {
         match self {
-            FCSEvent::F32(data) => data.iter().map(|&x| x as f64).collect(),
             FCSEvent::F64(data) => data.to_owned(),
-            FCSEvent::U16(data) => data.iter().map(|&x| x as f64).collect(),
-            FCSEvent::U32(data) => data.iter().map(|&x| x as f64).collect(),
-            FCSEvent::U64(data) => data.iter().map(|&x| x as f64).collect(),
-            FCSEvent::U128(data) => data.iter().map(|&x| x as f64).collect(),
+            FCSEvent::F32(data) => as_f64!(data),
+            FCSEvent::U128(data) => as_f64!(data),
+            FCSEvent::U64(data) => as_f64!(data),
+            FCSEvent::U32(data) => as_f64!(data),
+            FCSEvent::U16(data) => as_f64!(data), 
         }
     }
 }
@@ -188,8 +195,8 @@ pub fn read_fcs<P: AsRef<Path>>(path: P) -> Result<Sample, FCSError> {
     let event_data = parse_fcs_event_data(&mut reader, &metadata)?;
     
     Ok(Sample {
-        metadata: HashMap::new(),
-        event_data: HashMap::new(),
+        metadata,
+        event_data,
     })
 }
 
@@ -290,15 +297,13 @@ fn parse_fcs_event_data(reader: &mut BufReader<File>, metadata: &HashMap<String,
     let capacity: usize = n_events * n_params;
 
     let mut event_data: HashMap<String, Vec<f64>> = HashMap::with_capacity(n_params);
-    let mut events: Vec<f64> = Vec::with_capacity(capacity);
+    let mut events: Vec<f64>;
 
     if capacity == 0 {
         return Ok(event_data)
     }
 
     let data_segment_start: u64 = metadata.get("$BEGINDATA").unwrap().parse()?;
-    let data_segment_end: u64 = metadata.get("$ENDDATA").unwrap().parse()?;
-    let data_segment_size: u64 = data_segment_end - data_segment_start;
     reader.seek(SeekFrom::Start(data_segment_start))?;
 
     for i in 1..=n_params {
