@@ -1,0 +1,9 @@
+[package]
+name = "libreflow-api"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+atoi = "2.0.0"
+derive_more = { version = "1.0.0-beta", features = ["from", "display"] }
+nom = "7.1.3"
