@@ -5,7 +5,7 @@ use nom::{
     branch::alt,
     bytes::complete::{escaped_transform, is_not, tag, take, take_while},
     combinator::{map_res, value},
-    error::ErrorKind,
+    error::{ErrorKind, ParseError},
     multi::fold_many1,
     sequence::{pair, preceded, separated_pair, terminated, tuple},
     IResult,
@@ -14,8 +14,10 @@ use regex::Regex;
 use std::{
     collections::HashMap,
     io::{self, BufReader, Read, Seek, SeekFrom},
+    num::ParseIntError,
     ops::RangeInclusive,
     str::Utf8Error,
+    string::FromUtf8Error,
 };
 
 use crate::fcs::File;
@@ -83,14 +85,23 @@ const OPTIONAL_KEYWORDS: [&str; 31] = [
 #[derive(Display, From, Debug)]
 pub enum Error {
     InvalidFileType,
+    #[from]
     Io(std::io::Error),
     InvalidFCSVersion,
-    FcsParseError(Utf8Error),
+    #[from]
+    FromUtf8Error(FromUtf8Error),
     InvalidMetadata,
+    FailedMetadataParse,
+    FailedHeaderParse(String),
+    #[from]
+    FailedNomParse(String),
+    #[from]
+    FaileIntParse(ParseIntError),
+    FailedDelimiterParse,
 }
 
 /// FCS IO result
-pub type Result<T> = std::result::Result<T, Error>;
+pub type Result<T> = core::result::Result<T, Error>;
 
 impl File {
     /// Attempts to open an FCS file in read-only mode.
@@ -133,7 +144,7 @@ impl Header {
         reader.read_exact(&mut version)?;
 
         let version = if VALID_FCS_VERSIONS.contains(&&version) {
-            String::from_utf8(version.to_vec()).unwrap()
+            String::from_utf8(version.to_vec())?
         } else {
             return Err(Error::InvalidFCSVersion);
         };
@@ -143,10 +154,9 @@ impl Header {
         let mut offset_bytes = [0u8; 48];
         reader.read_exact(&mut offset_bytes)?;
 
-        // FIXME: return nom error wrapped in Error
-        let (offset_bytes, text_offsets) = parse_segment(&offset_bytes).unwrap();
-        let (offset_bytes, data_offsets) = parse_segment(&offset_bytes).unwrap();
-        let (_, analysis_offsets) = parse_segment(&offset_bytes).unwrap();
+        let (offset_bytes, text_offsets) = parse_segment(&offset_bytes)?;
+        let (offset_bytes, data_offsets) = parse_segment(&offset_bytes)?;
+        let (_, analysis_offsets) = parse_segment(&offset_bytes)?;
 
         Ok(Header {
             version,
@@ -158,8 +168,10 @@ impl Header {
 }
 
 /// Helper for parsing a single segment offset
-fn parse_segment(input: &[u8]) -> IResult<&[u8], RangeInclusive<usize>> {
-    let (input, (start, stop)) = tuple((parse_offset_bytes, parse_offset_bytes))(input)?;
+fn parse_segment(input: &[u8]) -> Result<(&[u8], RangeInclusive<usize>)> {
+    let (input, (start, stop)) = tuple((parse_offset_bytes, parse_offset_bytes))(input)
+        .map_err(|_| Error::FailedHeaderParse("Could not parse header segment".to_string()))?;
+
     Ok((input, start..=stop))
 }
 
@@ -171,26 +183,30 @@ fn parse_offset_bytes(input: &[u8]) -> IResult<&[u8], usize> {
 }
 
 /// FCS metadata object
-pub struct Metadata {
-    text_offsets: RangeInclusive<usize>,
-    data_offsets: RangeInclusive<usize>,
-    analysis_offsets: RangeInclusive<usize>,
+pub struct Metadata<'a> {
+    text_offsets: &'a RangeInclusive<usize>,
+    data_offsets: &'a RangeInclusive<usize>,
+    analysis_offsets: &'a RangeInclusive<usize>,
     pub text_segment: HashMap<String, String>,
 }
 
-impl Metadata {
+impl<'a> Metadata<'a> {
     /// Parse FCS metadata given a bufreader and header information.
-    pub fn parse(reader: &mut BufReader<&std::fs::File>, header: &Header) -> Result<Metadata> {
+    pub fn parse(
+        reader: &mut BufReader<&std::fs::File>,
+        header: &'a Header,
+    ) -> Result<Metadata<'a>> {
         reader.seek(SeekFrom::Start(*header.text_offsets.start() as u64))?;
-        let n_metadata_bytes = (*header.text_offsets.end() - *header.text_offsets.start()) as usize;
+        let n_metadata_bytes = (*header.text_offsets.end() - *header.text_offsets.start());
         let mut metadata_bytes = vec![0u8; n_metadata_bytes];
         reader.read_exact(&mut metadata_bytes)?;
 
         // FIXME unwrap here
-        let metadata_text = String::from_utf8(metadata_bytes).unwrap();
+        let metadata_text = String::from_utf8(metadata_bytes)?;
 
         // Parse metadata text
-        let (metadata_text, delimiter) = parse_delimiter(&metadata_text).unwrap(); // FIXME unwrap
+        let (metadata_text, delimiter) =
+            parse_delimiter(&metadata_text).map_err(|_| Error::FailedDelimiterParse)?;
 
         // We handle double delimiters by replacing them with a temporary string.
         // This is done simply because it's a pain to handle double delimiters
@@ -207,17 +223,17 @@ impl Metadata {
                 acc
             },
         )(&metadata_text)
-        .unwrap(); // FIXME unwrap
+        .map_err(|_| Error::FailedMetadataParse)?;
 
         Ok(Metadata {
-            text_offsets: header.text_offsets.clone(),
-            data_offsets: header.data_offsets.clone(),
-            analysis_offsets: header.analysis_offsets.clone(),
+            text_offsets: &header.text_offsets,
+            data_offsets: &header.data_offsets,
+            analysis_offsets: &header.analysis_offsets,
             text_segment: metadata,
         })
     }
 
-    /// Check that all required keys are present.
+    /// Check that all recovered metadata keys are valid and segment offsets match.
     fn is_valid(&self) -> Result<()> {
         // this is a required key so we just return an error if not found
         let n_params = self
@@ -227,6 +243,7 @@ impl Metadata {
 
         let n_digits = n_params.chars().count().to_string();
         let parameter_indexed_regex = r"[PR]\d{1,".to_string() + &n_digits + "}[BENRDFGLOPSTVIW]";
+        // this is safe to unwrap since regex has to be valid
         let param_keywords = Regex::new(&parameter_indexed_regex).unwrap();
 
         // check that keys are valid
@@ -239,7 +256,25 @@ impl Metadata {
             }
         }
 
-        Ok(()) // valid metadata
+        // check that data segment offsets from header match those in metadata
+        let begin_data = self.get_required_key("$BEGINDATA")?;
+        let end_data = self.get_required_key("$ENDDATA")?;
+        validate_metadata_offsets(
+            begin_data.parse::<usize>()?,
+            end_data.parse::<usize>()?,
+            &self.data_offsets,
+        )?;
+
+        // check that analysis segment offsets from header match those in metadata
+        let begin_analysis = self.get_required_key("$BEGINANALYSIS")?;
+        let end_analysis = self.get_required_key("$ENDANALYSIS")?;
+        validate_metadata_offsets(
+            begin_analysis.parse::<usize>()?,
+            end_analysis.parse::<usize>()?,
+            &self.analysis_offsets,
+        )?;
+
+        Ok(())
     }
 
     fn get_required_key(&self, key: &str) -> Result<&str> {
@@ -275,6 +310,18 @@ fn parse_metadata_pairs<'a>(input: &'a str, delimiter: &str) -> IResult<&'a str,
             tag(delimiter),
         ),
     )(input)
+}
+
+fn validate_metadata_offsets(
+    seg_start: usize,
+    seg_end: usize,
+    seg_offsets: &RangeInclusive<usize>,
+) -> Result<()> {
+    if seg_start != *seg_offsets.start() || seg_end != *seg_offsets.end() {
+        return Err(Error::InvalidMetadata);
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
