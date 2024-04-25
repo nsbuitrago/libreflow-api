@@ -10,6 +10,7 @@ use nom::{
     sequence::{pair, preceded, separated_pair, terminated, tuple},
     IResult,
 };
+use regex::Regex;
 use std::{
     collections::HashMap,
     io::{self, BufReader, Read, Seek, SeekFrom},
@@ -27,6 +28,57 @@ const VALID_FCS_VERSIONS: [&[u8; 6]; 2] = [b"FCS3.0", b"FCS3.1"];
 /// The temporary string is replaced with a single delimiter after parsing.
 const DOUBLE_DELIMITER_TRANSFORM: &str = "@ESCAPED@";
 
+/// Required non-parameter indexed keywords in the text segment.
+const REQUIRED_KEYWORDS: [&str; 12] = [
+    "$BEGINANALYSIS", // byte-offset to the beginning of analysis segment
+    "$BEGINDATA",     // byte-offset of beginning of data segment
+    "$BEGINSTEXT",    // byte-offset to beginning of text segment
+    "$BYTEORD",       // byte order for data acquisition computer
+    "$DATATYPE",      // type of data in data segment (ASCII, int, float)
+    "$ENDANALYSIS",   // byte-offset to end of analysis segment
+    "$ENDDATA",       // byte-offset to end of data segment
+    "$ENDSTEXT",      // byte-offset to end of text segment
+    "$MODE",          // data mode (list mode - preferred, histogram - deprecated)
+    "$NEXTDATA",      // byte-offset to next data set in the file
+    "$PAR",           // number of parameters in an event
+    "$TOT",           // total number of events in the data set
+];
+
+/// Optional non-paramater indexed keywords
+const OPTIONAL_KEYWORDS: [&str; 31] = [
+    "$ABRT",          // events lost due to acquisition electronic coincidence
+    "$BTIM",          // clock time at beginning of data acquisition
+    "$CELLS",         // description of objects measured
+    "$COM",           // comment
+    "$CSMODE",        // cell subset mode, number of subsets an object may belong
+    "$CSVBITS",       // number of bits used to encode cell subset identifier
+    "$CYT",           // cytometer type
+    "$CYTSN",         // cytometer serial number
+    "$DATE",          // date of data acquisition
+    "$ETIM",          // clock time at end of data acquisition
+    "$EXP",           // investigator name initiating experiment
+    "$FIL",           // name of data file containing data set
+    "$GATE",          // number of gating parameters
+    "$GATING",        // region combinations used for gating
+    "$INST",          // institution where data was acquired
+    "$LAST_MODIFIED", // timestamp of last modification
+    "$LAST_MODIFIER", // person performing last modification
+    "$LOST",          // number events lost due to computer busy
+    "$OP",            // name of flow cytometry operator
+    "$ORIGINALITY",   // information whether FCS data set has been modified or not
+    "$PLATEID",       // plate identifier
+    "$PLATENAME",     // plate name
+    "$PROJ",          // project name
+    "$SMNO",          // specimen (i.e., tube) label
+    "$SPILLOVER",     // spillover matrix
+    "$SRC",           // source of specimen (cell type, name, etc.)
+    "$SYS",           // type of computer and OS
+    "$TIMESTEP",      // time step for time parameter
+    "$TR",            // trigger paramter and its threshold
+    "$VOL",           // volume of sample run during data acquisition
+    "$WELLID",        // well identifier
+];
+
 /// FCS IO errors
 #[derive(Display, From, Debug)]
 pub enum Error {
@@ -34,6 +86,7 @@ pub enum Error {
     Io(std::io::Error),
     InvalidFCSVersion,
     FcsParseError(Utf8Error),
+    InvalidMetadata,
 }
 
 /// FCS IO result
@@ -56,7 +109,10 @@ impl File {
         let mut reader = BufReader::new(&self.inner);
         let header = Header::parse(&mut reader)?;
         let mut metadata = Metadata::parse(&mut reader, &header)?;
-        metadata.insert(String::from("version"), header.version);
+        metadata.is_valid()?;
+        metadata
+            .text_segment
+            .insert(String::from("version"), header.version);
         // let data = Data::parse(&mut reader, &header.data_offsets)?;
 
         Ok(())
@@ -83,6 +139,7 @@ impl Header {
         };
 
         reader.seek(SeekFrom::Current(4))?; // skip 4 bytes encoding whitespace
+
         let mut offset_bytes = [0u8; 48];
         reader.read_exact(&mut offset_bytes)?;
 
@@ -123,10 +180,7 @@ pub struct Metadata {
 
 impl Metadata {
     /// Parse FCS metadata given a bufreader and header information.
-    pub fn parse(
-        reader: &mut BufReader<&std::fs::File>,
-        header: &Header,
-    ) -> Result<HashMap<String, String>> {
+    pub fn parse(reader: &mut BufReader<&std::fs::File>, header: &Header) -> Result<Metadata> {
         reader.seek(SeekFrom::Start(*header.text_offsets.start() as u64))?;
         let n_metadata_bytes = (*header.text_offsets.end() - *header.text_offsets.start()) as usize;
         let mut metadata_bytes = vec![0u8; n_metadata_bytes];
@@ -155,12 +209,44 @@ impl Metadata {
         )(&metadata_text)
         .unwrap(); // FIXME unwrap
 
-        Ok(metadata)
+        Ok(Metadata {
+            text_offsets: header.text_offsets.clone(),
+            data_offsets: header.data_offsets.clone(),
+            analysis_offsets: header.analysis_offsets.clone(),
+            text_segment: metadata,
+        })
     }
 
-    /// Check that all required keys are present
+    /// Check that all required keys are present.
     fn is_valid(&self) -> Result<()> {
-        Ok(())
+        // this is a required key so we just return an error if not found
+        let n_params = self
+            .text_segment
+            .get("$PAR")
+            .ok_or(Error::InvalidMetadata)?;
+
+        let n_digits = n_params.chars().count().to_string();
+        let parameter_indexed_regex = r"[PR]\d{1,".to_string() + &n_digits + "}[BENRDFGLOPSTVIW]";
+        let param_keywords = Regex::new(&parameter_indexed_regex).unwrap();
+
+        // check that keys are valid
+        for key in self.text_segment.keys() {
+            if !REQUIRED_KEYWORDS.contains(&key.as_str())
+                && !param_keywords.is_match(key)
+                && !OPTIONAL_KEYWORDS.contains(&key.as_str())
+            {
+                return Err(Error::InvalidMetadata);
+            }
+        }
+
+        Ok(()) // valid metadata
+    }
+
+    fn get_required_key(&self, key: &str) -> Result<&str> {
+        self.text_segment
+            .get(key)
+            .ok_or(Error::InvalidMetadata)
+            .map(|s| s.as_str())
     }
 }
 
@@ -256,5 +342,14 @@ mod tests {
         .unwrap();
 
         assert_eq!(metadata, true_metadata_map);
+    }
+
+    #[test]
+    fn full_fcs_parser() -> Result<()> {
+        let file = File::open("tests/data/test_fcs_3_1.fcs")?;
+        let data = file.parse();
+        println!("{:?}", data);
+
+        Ok(())
     }
 }
