@@ -1,7 +1,16 @@
 mod io;
 
-/// FCS file object
+use io::Metadata;
+use std::collections::HashMap;
+
+/// FCS Sample object
 #[derive(Debug)]
-pub struct File {
-    inner: std::fs::File,
+pub struct Sample {
+    metadata: Metadata,
+    data: HashMap<String, Vec<f64>>,
+}
+
+/// FCS experiment object
+pub struct Experiment {
+    samples: Vec<Sample>,
 }

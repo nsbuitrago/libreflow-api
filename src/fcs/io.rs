@@ -1,5 +1,6 @@
 #![allow(dead_code, unused)]
 use atoi::atoi;
+use byteorder::{ByteOrder, ReadBytesExt};
 use derive_more::{Display, From};
 use nom::{
     branch::alt,
@@ -20,10 +21,10 @@ use std::{
     string::FromUtf8Error,
 };
 
-use crate::fcs::File;
+use crate::fcs::Sample;
 
 /// Currently supported FCS versions.
-const VALID_FCS_VERSIONS: [&[u8; 6]; 2] = [b"FCS3.0", b"FCS3.1"];
+const VALID_FCS_VERSIONS: [&[u8; 6]; 1] = [b"FCS3.1"];
 
 /// Escaped delimiters in keys or values in the text segment are replaced with
 /// this temporary string during parsing. This is done to simplify parsing.
@@ -89,7 +90,7 @@ pub enum Error {
     Io(std::io::Error),
     InvalidFCSVersion,
     #[from]
-    FromUtf8Error(FromUtf8Error),
+    FailedUtf8Parse(FromUtf8Error),
     InvalidMetadata,
     FailedMetadataParse,
     FailedHeaderParse(String),
@@ -98,10 +99,45 @@ pub enum Error {
     #[from]
     FaileIntParse(ParseIntError),
     FailedDelimiterParse,
+    InvalidData(String),
+
+    #[display("Metadata key not found: {}", key)]
+    MetadataKeyNotFound {
+        key: String,
+    },
+
+    #[display("Invalid data mode: {} for FCS version: {}", mode, version)]
+    InvalidDataMode {
+        mode: String,
+        version: String,
+    },
+
+    #[display("Invalid data type: {} for FCS version: {}", data_type, version)]
+    InvalidDataType {
+        data_type: String,
+        version: String,
+    },
+
+    #[display("Invalid byte order: {}", byte_order)]
+    InvalidByteOrder {
+        byte_order: String,
+    },
+
+    #[display("Invalid bit length {} for parameter index {}", bit_length, index)]
+    InvalidParameterBitLength {
+        bit_length: usize,
+        index: usize,
+    },
 }
 
 /// FCS IO result
 pub type Result<T> = core::result::Result<T, Error>;
+
+/// FCS file object
+#[derive(Debug)]
+pub struct File {
+    inner: std::fs::File,
+}
 
 impl File {
     /// Attempts to open an FCS file in read-only mode.
@@ -116,17 +152,15 @@ impl File {
         Ok(Self { inner })
     }
 
-    pub fn parse(&self) -> Result<()> {
+    pub fn parse(&self) -> Result<Sample> {
         let mut reader = BufReader::new(&self.inner);
         let header = Header::parse(&mut reader)?;
         let mut metadata = Metadata::parse(&mut reader, &header)?;
         metadata.is_valid()?;
-        metadata
-            .text_segment
-            .insert(String::from("version"), header.version);
-        // let data = Data::parse(&mut reader, &header.data_offsets)?;
+        let data = Data::parse(&mut reader, &header.data_offsets, &metadata)?;
+        //let sample = Sample { metadata, data };
 
-        Ok(())
+        Ok(Sample { metadata, data })
     }
 }
 
@@ -155,8 +189,8 @@ impl Header {
         reader.read_exact(&mut offset_bytes)?;
 
         let (offset_bytes, text_offsets) = parse_segment(&offset_bytes)?;
-        let (offset_bytes, data_offsets) = parse_segment(&offset_bytes)?;
-        let (_, analysis_offsets) = parse_segment(&offset_bytes)?;
+        let (offset_bytes, data_offsets) = parse_segment(offset_bytes)?;
+        let (_, analysis_offsets) = parse_segment(offset_bytes)?;
 
         Ok(Header {
             version,
@@ -183,19 +217,18 @@ fn parse_offset_bytes(input: &[u8]) -> IResult<&[u8], usize> {
 }
 
 /// FCS metadata object
-pub struct Metadata<'a> {
-    text_offsets: &'a RangeInclusive<usize>,
-    data_offsets: &'a RangeInclusive<usize>,
-    analysis_offsets: &'a RangeInclusive<usize>,
+#[derive(Debug, Clone)]
+pub struct Metadata {
+    version: String,
+    text_offsets: RangeInclusive<usize>,
+    data_offsets: RangeInclusive<usize>,
+    analysis_offsets: RangeInclusive<usize>,
     pub text_segment: HashMap<String, String>,
 }
 
-impl<'a> Metadata<'a> {
+impl Metadata {
     /// Parse FCS metadata given a bufreader and header information.
-    pub fn parse(
-        reader: &mut BufReader<&std::fs::File>,
-        header: &'a Header,
-    ) -> Result<Metadata<'a>> {
+    pub fn parse(reader: &mut BufReader<&std::fs::File>, header: &Header) -> Result<Metadata> {
         reader.seek(SeekFrom::Start(*header.text_offsets.start() as u64))?;
         let n_metadata_bytes = (*header.text_offsets.end() - *header.text_offsets.start());
         let mut metadata_bytes = vec![0u8; n_metadata_bytes];
@@ -226,9 +259,10 @@ impl<'a> Metadata<'a> {
         .map_err(|_| Error::FailedMetadataParse)?;
 
         Ok(Metadata {
-            text_offsets: &header.text_offsets,
-            data_offsets: &header.data_offsets,
-            analysis_offsets: &header.analysis_offsets,
+            version: header.version.to_owned(),
+            text_offsets: header.text_offsets.clone(),
+            data_offsets: header.data_offsets.clone(),
+            analysis_offsets: header.analysis_offsets.clone(),
             text_segment: metadata,
         })
     }
@@ -280,7 +314,9 @@ impl<'a> Metadata<'a> {
     fn get_required_key(&self, key: &str) -> Result<&str> {
         self.text_segment
             .get(key)
-            .ok_or(Error::InvalidMetadata)
+            .ok_or(Error::MetadataKeyNotFound {
+                key: key.to_string(),
+            })
             .map(|s| s.as_str())
     }
 }
@@ -322,6 +358,182 @@ fn validate_metadata_offsets(
     }
 
     Ok(())
+}
+
+pub trait IsValid {
+    /// Check if metadata is valid for the given FCS version.
+    fn is_valid(&self, version: &str) -> Result<()>;
+}
+
+enum DataMode {
+    List,
+    CorrelatedHistogram,
+    UncorrelatedHistogram,
+}
+
+enum DataType {
+    UInt,
+    Single, // single precision IEEE floating point
+    Double, // double precision IEEE floating point
+    Ascii,
+}
+
+/// FCS data object
+struct Data {
+    data_offsets: RangeInclusive<usize>,
+}
+
+impl Data {
+    /// Parse data segment
+    fn parse(
+        reader: &mut BufReader<&std::fs::File>,
+        data_offsets: &RangeInclusive<usize>,
+        metadata: &Metadata,
+    ) -> Result<HashMap<String, Vec<f64>>> {
+        let version = &metadata.version;
+        match version.as_str() {
+            "FCS3.1" => {
+                let data_mode = metadata.get_required_key("$MODE")?;
+                let data_mode = match data_mode {
+                    "L" => Ok(DataMode::List),
+                    _ => Err(Error::InvalidDataMode {
+                        mode: data_mode.to_string(),
+                        version: version.to_owned(),
+                    }),
+                }?;
+
+                let data_type = metadata.get_required_key("$DATATYPE")?;
+                let data_type = match data_type {
+                    "I" => Ok(DataType::UInt),
+                    "F" => Ok(DataType::Single),
+                    "D" => Ok(DataType::Double),
+                    _ => Err(Error::InvalidDataType {
+                        data_type: data_type.to_string(),
+                        version: version.to_owned(),
+                    }),
+                }?;
+
+                let n_params = metadata.get_required_key("$PAR")?.parse::<usize>()?;
+                let n_events = metadata.get_required_key("$TOT")?.parse::<usize>()?;
+                let capacity = n_params * n_events;
+
+                if capacity == 0 {
+                    return Err(Error::InvalidData("No data found".to_string()));
+                }
+
+                let byte_order = metadata.get_required_key("$BYTEORD")?;
+
+                reader.seek(SeekFrom::Start(*metadata.data_offsets.start() as u64))?;
+                let mut events = Vec::with_capacity(n_events);
+                let mut data: HashMap<String, Vec<f64>> = HashMap::with_capacity(n_params);
+
+                // If data type is I i need to check each paramater for max bit length
+                // and int range used by the parameter
+                // for F, need to assert that PnB keywords are set to 32
+                // and PnE keywords are set to 0,0
+                // for D, need to assert that PnB keywords are set to 64
+                // and PnE keywords are set to 0,0
+                for i in 1..=n_params {
+                    match byte_order {
+                        "1,2,3,4" => {
+                            events = parse_event_data::<byteorder::LittleEndian>(
+                                reader, &data_type, n_events, &metadata, i,
+                            )?
+                        }
+                        "4,3,2,1" => {
+                            events = parse_event_data::<byteorder::BigEndian>(
+                                reader, &data_type, n_events, &metadata, i,
+                            )?
+                        }
+                        _ => {
+                            return Err(Error::InvalidByteOrder {
+                                byte_order: byte_order.to_string(),
+                            })
+                        }
+                    }
+
+                    let id = metadata.get_required_key(&format!("$P{}N", i))?;
+                    data.insert(id.to_string(), events);
+                }
+                Ok(data)
+            }
+            "FCS3.0" => {
+                //let data_mode = metadata.get_required_key("$MODE")?;
+                //let data_mode = match data_mode {
+                //    "L" => Ok(DataMode::List),
+                //    "H" => Ok(DataMode::CorrelatedHistogram),
+                //    "U" => Ok(DataMode::UncorrelatedHistogram),
+                //    _ => Err(Error::InvalidDataMode {
+                //        mode: data_mode.to_string(),
+                //        version: version.to_owned(),
+                //    }),
+                //}?;
+                unimplemented!()
+            }
+            _ => unreachable!(), // we already checked that version is valid
+        }
+    }
+}
+
+fn parse_event_data<B: byteorder::ByteOrder>(
+    reader: &mut BufReader<&std::fs::File>,
+    data_type: &DataType,
+    n_events: usize,
+    metadata: &Metadata,
+    index: usize,
+) -> Result<Vec<f64>> {
+    let mut data: Vec<f64> = Vec::with_capacity(n_events);
+    match data_type {
+        DataType::UInt => {
+            let bit_length = metadata
+                .get_required_key(&format!("P{}B", index))?
+                .parse::<usize>()?;
+            match bit_length {
+                16 => {
+                    for i in 0..n_events {
+                        let event = reader.read_u16::<B>()? as f64;
+                        data.push(event);
+                    }
+                }
+                32 => {
+                    for i in 0..n_events {
+                        let event = reader.read_u32::<B>()? as f64;
+                        data.push(event);
+                    }
+                }
+                64 => {
+                    for i in 0..n_events {
+                        let event = reader.read_u64::<B>()? as f64;
+                        data.push(event);
+                    }
+                }
+                128 => {
+                    for i in 0..n_events {
+                        let event = reader.read_u128::<B>()? as f64;
+                        data.push(event);
+                    }
+                }
+                _ => return Err(Error::InvalidParameterBitLength { bit_length, index }),
+            }
+        }
+        DataType::Single => {
+            for i in 0..n_events {
+                let event = reader.read_f32::<B>()? as f64;
+                data.push(event);
+            }
+        }
+        DataType::Double => {
+            for i in 0..n_events {
+                let event = reader.read_f64::<B>()?;
+                data.push(event);
+            }
+        }
+        DataType::Ascii => {
+            unimplemented!()
+        }
+    }
+
+    Ok(data)
 }
 
 #[cfg(test)]
@@ -394,8 +606,16 @@ mod tests {
     #[test]
     fn full_fcs_parser() -> Result<()> {
         let file = File::open("tests/data/test_fcs_3_1.fcs")?;
-        let data = file.parse();
-        println!("{:?}", data);
+        let sample = file.parse()?;
+
+        let n_params = sample.metadata.get_required_key("$PAR")?.parse::<usize>()?;
+        let n_param_vecs = sample.data.len();
+        assert_eq!(n_params, n_param_vecs);
+
+        let n_events = sample.metadata.get_required_key("$TOT")?.parse::<usize>()?;
+        let param_id = sample.metadata.get_required_key("$P1N")?;
+        let param_data = sample.data.get(param_id).unwrap();
+        assert_eq!(n_events, param_data.len());
 
         Ok(())
     }
