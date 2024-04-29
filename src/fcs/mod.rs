@@ -1,16 +1,16 @@
 mod io;
 
-use io::Metadata;
 use std::collections::HashMap;
 
-/// FCS Sample object
-#[derive(Debug)]
+/// Metadata aliased as a hash-map with
+pub type Metadata = HashMap<String, String>;
+
+/// EventData aliased as a hash-map with parameter IDs as strings and their
+/// event data as a vector of f64s.
+pub type EventData = HashMap<String, Vec<f64>>;
+
+/// FCS sample object containing metadata and event data.
 pub struct Sample {
     metadata: Metadata,
-    data: HashMap<String, Vec<f64>>,
-}
-
-/// FCS experiment object
-pub struct Experiment {
-    samples: Vec<Sample>,
+    event_data: EventData,
 }
