@@ -1,4 +1,4 @@
-mod io;
+pub mod io;
 
 use std::collections::HashMap;
 
