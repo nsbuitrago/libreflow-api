@@ -1,7 +1,10 @@
 [package]
 name = "libreflow-api"
-version = "0.1.0"
+version = "0.0.1-alpha"
 edition = "2021"
+description = "FCS/GatingML library"
+repository = "https://github.com/nsbuitrago/libreflow-api"
+license = "MIT"
 
 [dependencies]
 atoi = "2.0.0"
