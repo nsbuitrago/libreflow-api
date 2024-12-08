@@ -1,8 +1,8 @@
 //! # LibreFlow API
 //!
-//! An FCS/GatingML library.
+//! An FCS/GatingML Crate.
 //!
-//! This library is used in the LibreFlow application for handling FCS and
+//! This Crate is used in the LibreFlow application for handling FCS and
 //! GatingML data. If you need these tools outside of the main LibreFlow
 //! application, consider using this library.
 //!
@@ -10,4 +10,3 @@
 
 #![feature(byte_slice_trim_ascii)]
 pub mod fcs;
-// pub mod gml;
