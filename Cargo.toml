@@ -1,6 +1,6 @@
 [package]
 name = "libreflow-api"
-version = "0.0.1-alpha"
+version = "0.0.1-alpha.1"
 edition = "2021"
 description = "FCS/GatingML library"
 repository = "https://github.com/nsbuitrago/libreflow-api"
@@ -12,3 +12,4 @@ byteorder = "1.5.0"
 derive_more = { version = "1.0.0-beta", features = ["from", "display"] }
 nom = "7.1.3"
 regex = "1.10.4"
+serde = { version = "1.0.215", features = ["derive"] }
