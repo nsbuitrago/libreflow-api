@@ -11,6 +11,6 @@ pub type EventData = HashMap<String, Vec<f64>>;
 
 /// FCS sample object containing metadata and event data.
 pub struct Sample {
-    metadata: Metadata,
-    event_data: EventData,
+    pub metadata: Metadata,
+    pub event_data: EventData,
 }

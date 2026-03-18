@@ -1,7 +1,7 @@
 use crate::fcs::{EventData, Metadata, Sample};
 use atoi::atoi;
 use byteorder::ReadBytesExt;
-use derive_more::{Display, From};
+use derive_more::Display;
 use nom::bytes::complete::{is_not, tag, take};
 use nom::combinator::map_res;
 use nom::error::ErrorKind;
@@ -10,78 +10,24 @@ use nom::sequence::{separated_pair, terminated, tuple};
 use nom::IResult;
 use regex::Regex;
 use std::collections::HashMap;
-use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
-use std::num::ParseIntError;
 use std::ops::RangeInclusive;
 use std::path::Path;
 use std::str::FromStr;
 
-/// FCS IO Error
-#[derive(Display, From, Debug)]
-pub enum Error {
-    #[from]
-    IO(std::io::Error),
+use crate::error::{Error, Result};
 
-    #[display("Invalid FCS version: {}", version)]
-    InvalidVersion {
-        version: String,
-    },
-
-    #[display("Invalid file type found. File must be fcs.")]
-    InvalidFileType,
-
-    #[display("Failed to parse header segment offset.")]
-    FailedHeaderOffsetParse,
-
-    #[display("Failed to parse text segment delimiter.")]
-    FailedDelimiterParse,
-
-    #[display("Metadata and header segment offsets don't match.")]
-    MetadataOffsetMismatch,
-
-    FailedMetadataParse,
-
-    #[from]
-    FailedIntParse(ParseIntError),
-
-    InvalidMetadata,
-
-    #[display("Invalid data mode: {data_mode} for version {version}")]
-    InvalidDataMode {
-        data_mode: String,
-        version: String,
-    },
-
-    #[display("Invalid data type: {kind} for version {version}")]
-    InvalidDataType {
-        kind: String,
-        version: String,
-    },
-
-    #[display("Could not find key: {key}, in FCS metadata")]
-    MetadataKeyNotFound {
-        key: String,
-    },
-
-    NoDataFound,
-
-    #[display("Invalid bit param length: {bit_length} for parameter index {index}")]
-    InvalidParamBitLength {
-        bit_length: usize,
-        index: usize,
-    },
-
-    InvalidByteOrder {
-        byte_order: String,
-    },
-
-    #[from]
-    FromUtf8Error(std::string::FromUtf8Error),
+pub struct File {
+    pub data: Sample,
 }
 
-/// FCS IO Result.
-type Result<T> = core::result::Result<T, Error>;
+impl File {
+    pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let data = read(path)?;
+
+        Ok(Self { data })
+    }
+}
 
 /// Attempts to read FCS file and return Sample data
 pub fn read<P: AsRef<Path>>(path: P) -> Result<Sample> {
@@ -89,7 +35,7 @@ pub fn read<P: AsRef<Path>>(path: P) -> Result<Sample> {
         return Err(Error::InvalidFileType);
     }
 
-    let file = File::open(path)?;
+    let file = std::fs::File::open(path)?;
     let mut reader = BufReader::new(file);
 
     let header = read_header(&mut reader)?;
@@ -144,7 +90,7 @@ struct Header {
 }
 
 /// Read FCS header segment.
-fn read_header(reader: &mut BufReader<File>) -> Result<Header> {
+fn read_header(reader: &mut BufReader<std::fs::File>) -> Result<Header> {
     let mut version_buffer = [0u8; 6];
     reader.read_exact(&mut version_buffer)?;
     let version = String::from_utf8(version_buffer.to_vec())?.parse::<Version>()?;
@@ -238,7 +184,7 @@ const OPTIONAL_KEYWORDS: [&str; 31] = [
 ];
 
 /// Read FCS text segment.
-fn read_metadata(reader: &mut BufReader<File>, header: &Header) -> Result<Metadata> {
+fn read_metadata(reader: &mut BufReader<std::fs::File>, header: &Header) -> Result<Metadata> {
     reader.seek(SeekFrom::Start(*header.text_offsets.start() as u64))?;
     let mut metadata_buf = vec![0u8; *header.text_offsets.end() - *header.text_offsets.start()];
     reader.read_exact(&mut metadata_buf)?;
@@ -524,7 +470,7 @@ mod tests {
 
     #[test]
     fn fcs_header_parser() -> Result<()> {
-        let file = File::open("tests/data/test_fcs_3_1.fcs")?;
+        let file = std::fs::File::open("tests/data/test_fcs_3_1.fcs")?;
         let mut reader = BufReader::new(file);
 
         let header = read_header(&mut reader)?;

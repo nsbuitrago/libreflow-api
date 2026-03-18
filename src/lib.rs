@@ -8,5 +8,5 @@
 //!
 //! Note that this crate is still under active development.
 
-#![feature(byte_slice_trim_ascii)]
+pub mod error;
 pub mod fcs;
