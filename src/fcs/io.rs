@@ -1,4 +1,3 @@
-use crate::fcs::{EventData, Metadata, Sample};
 use atoi::atoi;
 use byteorder::ReadBytesExt;
 use derive_more::Display;
@@ -8,6 +7,7 @@ use nom::error::ErrorKind;
 use nom::multi::fold_many1;
 use nom::sequence::{separated_pair, terminated, tuple};
 use nom::IResult;
+use polars::prelude::{Column, DataFrame};
 use regex::Regex;
 use std::collections::HashMap;
 use std::io::{BufReader, Read, Seek, SeekFrom};
@@ -17,35 +17,33 @@ use std::str::FromStr;
 
 use crate::error::{Error, Result};
 
+/// Metadata aliased as a hash-map with string keys and values.
+pub type Metadata = std::collections::HashMap<String, String>;
+
+#[derive(Debug, Clone)]
 pub struct File {
-    pub data: Sample,
+    pub metadata: Metadata,
+    pub event_data: DataFrame,
 }
 
 impl File {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let data = read(path)?;
+        if path.as_ref().extension() != Some("fcs".as_ref()) {
+            return Err(Error::InvalidFileType);
+        }
 
-        Ok(Self { data })
+        let file = std::fs::File::open(path)?;
+        let mut reader = BufReader::new(file);
+
+        let header = read_header(&mut reader)?;
+        let metadata = read_metadata(&mut reader, &header)?;
+        let event_data = read_event_data(&mut reader, &metadata)?;
+
+        Ok(Self {
+            metadata,
+            event_data,
+        })
     }
-}
-
-/// Attempts to read FCS file and return Sample data
-pub fn read<P: AsRef<Path>>(path: P) -> Result<Sample> {
-    if path.as_ref().extension() != Some("fcs".as_ref()) {
-        return Err(Error::InvalidFileType);
-    }
-
-    let file = std::fs::File::open(path)?;
-    let mut reader = BufReader::new(file);
-
-    let header = read_header(&mut reader)?;
-    let metadata = read_metadata(&mut reader, &header)?;
-    let event_data = read_event_data(&mut reader, &metadata)?;
-
-    Ok(Sample {
-        metadata,
-        event_data,
-    })
 }
 
 /// Valid FCS versions
@@ -82,6 +80,7 @@ impl Display for Version {
 }
 
 /// FCS header segment information.
+#[derive(Debug)]
 struct Header {
     version: Version,
     text_offsets: RangeInclusive<usize>,
@@ -101,8 +100,8 @@ fn read_header(reader: &mut BufReader<std::fs::File>) -> Result<Header> {
     reader.read_exact(&mut offset_buffer)?;
 
     let (offset_buffer, text_offsets) = parse_segment_offsets(&offset_buffer)?;
-    let (offset_buffer, data_offsets) = parse_segment_offsets(&offset_buffer)?;
-    let (_, analysis_offsets) = parse_segment_offsets(&offset_buffer)?;
+    let (offset_buffer, data_offsets) = parse_segment_offsets(offset_buffer)?;
+    let (_, analysis_offsets) = parse_segment_offsets(offset_buffer)?;
 
     Ok(Header {
         version,
@@ -113,6 +112,7 @@ fn read_header(reader: &mut BufReader<std::fs::File>) -> Result<Header> {
 }
 
 /// Helper for parsing a single segment offset in header
+#[inline]
 fn parse_segment_offsets(input: &[u8]) -> Result<(&[u8], RangeInclusive<usize>)> {
     let (input, (start, stop)) = tuple((parse_offset_bytes, parse_offset_bytes))(input)
         .map_err(|_| Error::FailedHeaderOffsetParse)?;
@@ -121,6 +121,7 @@ fn parse_segment_offsets(input: &[u8]) -> Result<(&[u8], RangeInclusive<usize>)>
 }
 
 /// Helper for parsing ascii encoded offset into an usize
+#[inline]
 fn parse_offset_bytes(input: &[u8]) -> IResult<&[u8], usize> {
     map_res(take(8usize), |bytes: &[u8]| {
         atoi::<usize>(bytes.trim_ascii_start()).ok_or(ErrorKind::Fail)
@@ -211,16 +212,18 @@ fn read_metadata(reader: &mut BufReader<std::fs::File>, header: &Header) -> Resu
     .map_err(|_| Error::FailedMetadataParse)?;
 
     metadata.is_valid()?;
-    cross_validate(&metadata, &header)?;
+    cross_validate(&metadata, header)?;
     Ok(metadata)
 }
 
 /// Parse text segment delimiter
+#[inline]
 fn parse_delimiter(input: &str) -> IResult<&str, &str> {
     take(1u8)(input)
 }
 
 /// Metadata string parser
+#[inline]
 fn parse_metadata_string<'a>(input: &'a str, delimiter: &str) -> IResult<&'a str, String> {
     map_res(is_not(delimiter), |s: &str| {
         // Here, we replace the temporary string with the delimiter after extracting
@@ -230,6 +233,7 @@ fn parse_metadata_string<'a>(input: &'a str, delimiter: &str) -> IResult<&'a str
 }
 
 /// Metadata key-value pair parser
+#[inline]
 fn parse_metadata_pairs<'a>(input: &'a str, delimiter: &str) -> IResult<&'a str, (String, String)> {
     separated_pair(
         |input| parse_metadata_string(input, delimiter), // keys
@@ -243,6 +247,7 @@ fn parse_metadata_pairs<'a>(input: &'a str, delimiter: &str) -> IResult<&'a str,
 }
 
 /// Check recovered segment offsets from metadata match those in header segment
+#[inline]
 fn validate_metadata_offsets(
     seg_start: usize,
     seg_end: usize,
@@ -262,6 +267,7 @@ trait GetRequiredKey {
 impl GetRequiredKey for Metadata {
     /// Attempt to get a required key from the metadata hashmap, but return an
     /// FCS IO Result rather than option better error handling.
+    #[inline]
     fn get_required_key(&self, key: &str) -> Result<&str> {
         self.get(key)
             .ok_or(Error::MetadataKeyNotFound {
@@ -352,7 +358,7 @@ fn cross_validate(metadata: &Metadata, header: &Header) -> Result<()> {
 fn read_event_data(
     reader: &mut BufReader<std::fs::File>,
     metadata: &Metadata,
-) -> Result<EventData> {
+) -> Result<DataFrame> {
     let n_params = metadata.get_required_key("$PAR")?.parse::<usize>()?;
     let n_events = metadata.get_required_key("$TOT")?.parse::<usize>()?;
     let capacity = n_params * n_events;
@@ -367,7 +373,7 @@ fn read_event_data(
 
     reader.seek(SeekFrom::Start(data_start))?;
     let mut events: Vec<f64>;
-    let mut data: HashMap<String, Vec<f64>> = HashMap::with_capacity(n_params);
+    let mut columns: Vec<Column> = Vec::with_capacity(n_params);
 
     match metadata.get_required_key("$MODE")? {
         // List mode
@@ -376,12 +382,12 @@ fn read_event_data(
                 match byte_order {
                     "1,2,3,4" => {
                         events = parse_events::<byteorder::LittleEndian>(
-                            reader, &data_type, n_events, metadata, i,
+                            reader, data_type, n_events, metadata, i,
                         )?;
                     }
                     "4,3,2,1" => {
                         events = parse_events::<byteorder::BigEndian>(
-                            reader, &data_type, n_events, metadata, i,
+                            reader, data_type, n_events, metadata, i,
                         )?;
                     }
                     _ => {
@@ -391,9 +397,9 @@ fn read_event_data(
                     }
                 }
                 let id = metadata.get_required_key(&format!("$P{}N", i))?;
-                data.insert(id.to_string(), events);
+                columns.push(Column::new(id.into(), events));
             }
-            Ok(data)
+            Ok(DataFrame::new_infer_height(columns)?)
         }
         "H" => todo!(),
         _ => unreachable!(),
@@ -514,15 +520,21 @@ mod tests {
 
     #[test]
     fn full_fcs_parser() -> Result<()> {
-        let sample = read("tests/data/test_fcs_3_1.fcs")?;
+        let fcs_file = File::open("tests/data/test_fcs_3_1.fcs")?;
 
-        let n_params = sample.metadata.get_required_key("$PAR")?.parse::<usize>()?;
-        let n_param_vecs = sample.event_data.len();
+        let n_params = fcs_file
+            .metadata
+            .get_required_key("$PAR")?
+            .parse::<usize>()?;
+        let n_param_vecs = fcs_file.event_data.width();
         assert_eq!(n_params, n_param_vecs);
 
-        let n_events = sample.metadata.get_required_key("$TOT")?.parse::<usize>()?;
-        let param_id = sample.metadata.get_required_key("$P1N")?;
-        let param_data = sample.event_data.get(param_id).unwrap();
+        let n_events = fcs_file
+            .metadata
+            .get_required_key("$TOT")?
+            .parse::<usize>()?;
+        let param_id = fcs_file.metadata.get_required_key("$P1N")?;
+        let param_data = fcs_file.event_data.column(param_id)?;
         assert_eq!(n_events, param_data.len());
 
         Ok(())

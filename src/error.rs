@@ -1,6 +1,7 @@
 use std::num::ParseIntError;
 
 use derive_more::{Display, From};
+use polars::error::PolarsError;
 
 /// FCS Result.
 pub type Result<T> = core::result::Result<T, Error>;
@@ -66,4 +67,7 @@ pub enum Error {
 
     #[from]
     FromUtf8Error(std::string::FromUtf8Error),
+
+    #[from]
+    Polars(PolarsError),
 }
