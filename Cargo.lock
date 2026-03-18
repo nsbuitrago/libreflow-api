@@ -435,7 +435,6 @@ dependencies = [
  "nom",
  "polars",
  "regex",
- "serde",
 ]
 
 [[package]]
